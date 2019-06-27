@@ -6,7 +6,7 @@ use crate::{
     pipeline,
     resource,
     swap_chain,
-    track::{DummyUsage, Stitch, TrackPermit, TrackerSet, Tracktion},
+    track::{Stitch, TrackerSet},
     AdapterId,
     BindGroupId,
     BufferAddress,
@@ -58,6 +58,7 @@ use std::{collections::hash_map::Entry, ffi, iter, ptr, ops::Range, slice, sync:
 
 const CLEANUP_WAIT_MS: u64 = 5000;
 pub const MAX_COLOR_TARGETS: usize = 4;
+pub const MAX_MIP_LEVELS: usize = 16;
 pub const MAX_VERTEX_BUFFERS: usize = 8;
 
 /// Bound uniform/storage buffer offsets must be aligned to this number.
@@ -93,12 +94,20 @@ enum HostMap {
 #[derive(Clone, Debug, Hash, PartialEq)]
 pub(crate) struct AttachmentData<T> {
     pub colors: ArrayVec<[T; MAX_COLOR_TARGETS]>,
+    pub resolves: ArrayVec<[T; MAX_COLOR_TARGETS]>,
     pub depth_stencil: Option<T>,
 }
 impl<T: PartialEq> Eq for AttachmentData<T> {}
 impl<T> AttachmentData<T> {
     pub(crate) fn all(&self) -> impl Iterator<Item = &T> {
-        self.colors.iter().chain(&self.depth_stencil)
+        self.colors.iter().chain(&self.resolves).chain(&self.depth_stencil)
+    }
+}
+
+impl RenderPassContext {
+    // Assumed the renderpass only contains one subpass
+    pub(crate) fn compatible(&self, other: &RenderPassContext) -> bool {
+        self.colors == other.colors && self.depth_stencil == other.depth_stencil
     }
 }
 
@@ -235,7 +244,7 @@ impl<B: hal::Backend> PendingResources<B> {
                     device.destroy_framebuffer(raw);
                 },
                 NativeResource::DescriptorSet(raw) => unsafe {
-                    descriptor_allocator.free(Some(raw).into_iter());
+                    descriptor_allocator.free(iter::once(raw));
                 },
             }
         }
@@ -424,7 +433,7 @@ fn map_buffer(
 #[derive(Debug)]
 pub struct Device<B: hal::Backend> {
     pub(crate) raw: B::Device,
-    adapter_id: AdapterId,
+    pub(crate) adapter_id: AdapterId,
     pub(crate) queue_group: hal::QueueGroup<B, hal::General>,
     pub(crate) com_allocator: command::CommandAllocator<B>,
     mem_allocator: Mutex<Heaps<B>>,
@@ -605,12 +614,12 @@ pub fn device_track_buffer(
     ref_count: RefCount,
     flags: resource::BufferUsage,
 ) {
-    let query = HUB.devices.read()[device_id]
+    let ok = HUB.devices.read()[device_id]
         .trackers
         .lock()
         .buffers
-        .query(buffer_id, &ref_count, flags);
-    assert!(query.initialized);
+        .init(buffer_id, &ref_count, (), flags);
+    assert!(ok);
 }
 
 #[cfg(feature = "local")]
@@ -680,12 +689,14 @@ pub fn device_create_texture(
     device_id: DeviceId,
     desc: &resource::TextureDescriptor,
 ) -> resource::Texture<back::Backend> {
-    let kind = conv::map_texture_dimension_size(desc.dimension, desc.size, desc.array_layer_count);
+    let kind = conv::map_texture_dimension_size(desc.dimension, desc.size, desc.array_layer_count, desc.sample_count);
     let format = conv::map_texture_format(desc.format);
     let aspects = format.surface_desc().aspects;
     let usage = conv::map_texture_usage(desc.usage, aspects);
     let device_guard = HUB.devices.read();
     let device = &device_guard[device_id];
+
+    assert!((desc.mip_level_count as usize) < MAX_MIP_LEVELS);
 
     let mut image = unsafe {
         device.raw.create_image(
@@ -735,17 +746,23 @@ pub fn device_create_texture(
     }
 }
 
-pub fn device_track_texture(device_id: DeviceId, texture_id: TextureId, ref_count: RefCount) {
-    let query = HUB.devices.read()[device_id]
+pub fn device_track_texture(
+    device_id: DeviceId,
+    texture_id: TextureId,
+    ref_count: RefCount,
+    full_range: hal::image::SubresourceRange,
+) {
+    let ok = HUB.devices.read()[device_id]
         .trackers
         .lock()
         .textures
-        .query(
+        .init(
             texture_id,
             &ref_count,
+            full_range,
             resource::TextureUsage::UNINITIALIZED,
         );
-    assert!(query.initialized);
+    assert!(ok);
 }
 
 #[cfg(feature = "local")]
@@ -756,8 +773,9 @@ pub extern "C" fn wgpu_device_create_texture(
 ) -> TextureId {
     let texture = device_create_texture(device_id, desc);
     let ref_count = texture.life_guard.ref_count.clone();
+    let range = texture.full_range.clone();
     let id = HUB.textures.register_local(texture);
-    device_track_texture(device_id, id, ref_count);
+    device_track_texture(device_id, id, ref_count, range);
     id
 }
 
@@ -779,7 +797,7 @@ pub fn texture_create_view(
                 view_kind,
                 conv::map_texture_format(format),
                 hal::format::Swizzle::NO,
-                range,
+                range.clone(),
             )
             .unwrap()
     };
@@ -791,8 +809,9 @@ pub fn texture_create_view(
             ref_count: texture.life_guard.ref_count.clone(),
         },
         format: texture.format,
-        extent: texture.kind.extent(),
+        extent: texture.kind.extent().at_level(range.levels.start),
         samples: texture.kind.num_samples(),
+        range,
         is_owned_by_swap_chain: false,
         life_guard: LifeGuard::new(),
     }
@@ -800,12 +819,12 @@ pub fn texture_create_view(
 
 pub fn device_track_view(texture_id: TextureId, view_id: TextureViewId, ref_count: RefCount) {
     let device_id = HUB.textures.read()[texture_id].device_id.value;
-    let query = HUB.devices.read()[device_id]
+    let ok = HUB.devices.read()[device_id]
         .trackers
         .lock()
         .views
-        .query(view_id, &ref_count, DummyUsage);
-    assert!(query.initialized);
+        .init(view_id, &ref_count, (), ());
+    assert!(ok);
 }
 
 #[cfg(feature = "local")]
@@ -1065,7 +1084,7 @@ pub fn device_create_bind_group(
                 );
                 let buffer = used
                     .buffers
-                    .get_with_extended_usage(&*buffer_guard, bb.buffer, usage)
+                    .use_extend(&*buffer_guard, bb.buffer, (), usage)
                     .unwrap();
                 let range = Some(bb.offset) .. Some(bb.offset + bb.size);
                 hal::pso::Descriptor::Buffer(&buffer.raw, range)
@@ -1087,14 +1106,15 @@ pub fn device_create_bind_group(
                     ),
                     _ => panic!("Mismatched texture binding for {:?}", decl),
                 };
-                let view = &texture_view_guard[id];
-                used.views.query(id, &view.life_guard.ref_count, DummyUsage);
+                let view = used.views
+                    .use_extend(&*texture_view_guard, id, (), ())
+                    .unwrap();
                 used.textures
-                    .transit(
+                    .change_extend(
                         view.texture_id.value,
                         &view.texture_id.ref_count,
+                        view.range.clone(),
                         usage,
-                        TrackPermit::EXTEND,
                     )
                     .unwrap();
                 hal::pso::Descriptor::Image(&view.raw, image_layout)
@@ -1127,15 +1147,15 @@ pub fn device_create_bind_group(
 
 pub fn device_track_bind_group(
     device_id: DeviceId,
-    buffer_id: BindGroupId,
+    bind_group_id: BindGroupId,
     ref_count: RefCount,
 ) {
-    let query = HUB.devices.read()[device_id]
+    let ok = HUB.devices.read()[device_id]
         .trackers
         .lock()
         .bind_groups
-        .query(buffer_id, &ref_count, DummyUsage);
-    assert!(query.initialized);
+        .init(bind_group_id, &ref_count, (), ());
+    assert!(ok);
 }
 
 #[cfg(feature = "local")]
@@ -1253,6 +1273,7 @@ pub extern "C" fn wgpu_queue_submit(
             let buffer_guard = HUB.buffers.read();
             let texture_guard = HUB.textures.read();
             let texture_view_guard = HUB.texture_views.read();
+            let bind_group_guard = HUB.bind_groups.read();
 
             // finish all the command buffers first
             for &cmb_id in command_buffer_ids {
@@ -1263,7 +1284,7 @@ pub extern "C" fn wgpu_queue_submit(
                     if frame.need_waiting.swap(false, Ordering::AcqRel) {
                         assert_eq!(frame.acquired_epoch, Some(link.epoch),
                             "{}. Image index {} with epoch {} != current epoch {:?}",
-                            "Attempting to rendering to a swapchain output that has already been presented",
+                            "Attempting to render to a swapchain output that has already been presented",
                             link.image_index, link.epoch, frame.acquired_epoch);
                         wait_semaphores.push((
                             &frame.sem_available,
@@ -1271,6 +1292,9 @@ pub extern "C" fn wgpu_queue_submit(
                         ));
                     }
                 }
+
+                // optimize the tracked states
+                comb.trackers.optimize();
 
                 // update submission IDs
                 for id in comb.trackers.buffers.used() {
@@ -1289,6 +1313,12 @@ pub extern "C" fn wgpu_queue_submit(
                 }
                 for id in comb.trackers.views.used() {
                     texture_view_guard[id]
+                        .life_guard
+                        .submission_index
+                        .store(submit_index, Ordering::Release);
+                }
+                for id in comb.trackers.bind_groups.used() {
+                    bind_group_guard[id]
                         .life_guard
                         .submission_index
                         .store(submit_index, Ordering::Release);
@@ -1373,6 +1403,11 @@ pub fn device_create_render_pipeline(
     device_id: DeviceId,
     desc: &pipeline::RenderPipelineDescriptor,
 ) -> pipeline::RenderPipeline<back::Backend> {
+    let sc = desc.sample_count;
+    assert!(sc == 1 || sc == 2 || sc == 4 || sc == 8 || sc == 16 || sc == 32,
+        "Invalid sample_count of {}", sc);
+    let sc = sc as u8;
+
     let device_guard = HUB.devices.read();
     let device = &device_guard[device_id];
     let pipeline_layout_guard = HUB.pipeline_layouts.read();
@@ -1388,15 +1423,20 @@ pub fn device_create_render_pipeline(
             .iter()
             .map(|at| hal::pass::Attachment {
                 format: Some(conv::map_texture_format(at.format)),
-                samples: desc.sample_count as u8,
+                samples: sc,
                 ops: hal::pass::AttachmentOps::PRESERVE,
                 stencil_ops: hal::pass::AttachmentOps::DONT_CARE,
                 layouts: hal::image::Layout::General .. hal::image::Layout::General,
             })
             .collect(),
+        // We can ignore the resolves as the vulkan specs says:
+        // As an additional special case, if two render passes have a single subpass,
+        // they are compatible even if they have different resolve attachment references
+        // or depth/stencil resolve modes but satisfy the other compatibility conditions.
+        resolves: ArrayVec::new(),
         depth_stencil: depth_stencil_state.map(|at| hal::pass::Attachment {
             format: Some(conv::map_texture_format(at.format)),
-            samples: desc.sample_count as u8,
+            samples: sc,
             ops: hal::pass::AttachmentOps::PRESERVE,
             stencil_ops: hal::pass::AttachmentOps::PRESERVE,
             layouts: hal::image::Layout::General .. hal::image::Layout::General,
@@ -1413,6 +1453,7 @@ pub fn device_create_render_pipeline(
                 (2, hal::image::Layout::ColorAttachmentOptimal),
                 (3, hal::image::Layout::ColorAttachmentOptimal),
             ];
+
             let depth_id = (
                 desc.color_states_length,
                 hal::image::Layout::DepthStencilAttachmentOptimal,
@@ -1517,8 +1558,17 @@ pub fn device_create_render_pipeline(
         .map(conv::map_depth_stencil_state_descriptor)
         .unwrap_or_default();
 
-    // TODO
-    let multisampling: Option<hal::pso::Multisampling> = None;
+    let multisampling: Option<hal::pso::Multisampling> = if sc == 1 {
+        None
+    } else {
+        Some(hal::pso::Multisampling {
+            rasterization_samples: sc,
+            sample_shading: None,
+            sample_mask: !0,
+            alpha_coverage: false,
+            alpha_to_one: false,
+        })
+    };
 
     // TODO
     let baked_states = hal::pso::BakedStates {
@@ -1564,6 +1614,7 @@ pub fn device_create_render_pipeline(
 
     let pass_context = RenderPassContext {
         colors: color_states.iter().map(|state| state.format).collect(),
+        resolves: ArrayVec::new(),
         depth_stencil: depth_stencil_state.map(|state| state.format),
     };
 
@@ -1586,6 +1637,7 @@ pub fn device_create_render_pipeline(
         flags,
         index_format: desc.vertex_input.index_format,
         vertex_strides,
+        sample_count: sc,
     }
 }
 
@@ -1786,6 +1838,7 @@ pub fn swap_chain_populate_textures(
     for (i, mut texture) in textures.into_iter().enumerate() {
         let format = texture.format;
         let kind = texture.kind;
+        let range = texture.full_range.clone();
 
         let view_raw = unsafe {
             device
@@ -1795,7 +1848,7 @@ pub fn swap_chain_populate_textures(
                     hal::image::ViewKind::D2,
                     conv::map_texture_format(format),
                     hal::format::Swizzle::NO,
-                    texture.full_range.clone(),
+                    range.clone(),
                 )
                 .unwrap()
         };
@@ -1808,9 +1861,10 @@ pub fn swap_chain_populate_textures(
             ref_count: texture.life_guard.ref_count.clone(),
             value: HUB.textures.register_local(texture),
         };
-        trackers.textures.query(
+        trackers.textures.init(
             texture_id.value,
             &texture_id.ref_count,
+            range.clone(),
             resource::TextureUsage::UNINITIALIZED,
         );
 
@@ -1820,6 +1874,7 @@ pub fn swap_chain_populate_textures(
             format,
             extent: kind.extent(),
             samples: kind.num_samples(),
+            range,
             is_owned_by_swap_chain: true,
             life_guard: LifeGuard::new(),
         };
@@ -1829,7 +1884,7 @@ pub fn swap_chain_populate_textures(
         };
         trackers
             .views
-            .query(view_id.value, &view_id.ref_count, DummyUsage);
+            .init(view_id.value, &view_id.ref_count, (), ());
 
         swap_chain.frames.alloc().init(swap_chain::Frame {
             texture_id,
@@ -1900,19 +1955,11 @@ pub extern "C" fn wgpu_buffer_map_read_async(
     let device_guard = HUB.devices.read();
     let device = &device_guard[device_id];
 
-    let usage = resource::BufferUsage::MAP_READ;
-    match device
+    device
         .trackers
         .lock()
         .buffers
-        .transit(buffer_id, &ref_count, usage, TrackPermit::REPLACE)
-    {
-        Ok(Tracktion::Keep) => {}
-        Ok(Tracktion::Replace { .. }) => {
-            //TODO: launch a memory barrier into `HOST_READ` access?
-        }
-        other => panic!("Invalid mapping transition {:?}", other),
-    }
+        .change_replace(buffer_id, &ref_count, (), resource::BufferUsage::MAP_READ);
 
     device.pending.lock().map(buffer_id, ref_count);
 }
@@ -1943,19 +1990,11 @@ pub extern "C" fn wgpu_buffer_map_write_async(
     let device_guard = HUB.devices.read();
     let device = &device_guard[device_id];
 
-    let usage = resource::BufferUsage::MAP_WRITE;
-    match device
+    device
         .trackers
         .lock()
         .buffers
-        .transit(buffer_id, &ref_count, usage, TrackPermit::REPLACE)
-    {
-        Ok(Tracktion::Keep) => {}
-        Ok(Tracktion::Replace { .. }) => {
-            //TODO: launch a memory barrier into `HOST_WRITE` access?
-        }
-        other => panic!("Invalid mapping transition {:?}", other),
-    }
+        .change_replace(buffer_id, &ref_count, (), resource::BufferUsage::MAP_WRITE);
 
     device.pending.lock().map(buffer_id, ref_count);
 }

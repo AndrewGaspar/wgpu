@@ -109,7 +109,6 @@ impl VertexState {
     }
 }
 
-#[derive(Debug)]
 pub struct RenderPass<B: hal::Backend> {
     raw: B::CommandBuffer,
     cmb_id: Stored<CommandBufferId>,
@@ -120,6 +119,7 @@ pub struct RenderPass<B: hal::Backend> {
     stencil_reference_status: OptionalState,
     index_state: IndexState,
     vertex_state: VertexState,
+    sample_count: u8,
 }
 
 impl<B: hal::Backend> RenderPass<B> {
@@ -127,6 +127,7 @@ impl<B: hal::Backend> RenderPass<B> {
         raw: B::CommandBuffer,
         cmb_id: Stored<CommandBufferId>,
         context: RenderPassContext,
+        sample_count: u8,
     ) -> Self {
         RenderPass {
             raw,
@@ -146,6 +147,7 @@ impl<B: hal::Backend> RenderPass<B> {
                 vertex_limit: 0,
                 instance_limit: 0,
             },
+            sample_count,
         }
     }
 
@@ -177,6 +179,7 @@ pub extern "C" fn wgpu_render_pass_end_pass(pass_id: RenderPassId) -> CommandBuf
     unsafe {
         pass.raw.end_render_pass();
     }
+    pass.trackers.optimize();
     let cmb = &mut cmb_guard[pass.cmb_id.value];
 
     match cmb.raw.last_mut() {
@@ -192,7 +195,7 @@ pub extern "C" fn wgpu_render_pass_end_pass(pass_id: RenderPassId) -> CommandBuf
             unsafe { last.finish() };
         }
         None => {
-            cmb.trackers.consume_by_extend(&pass.trackers);
+            cmb.trackers.merge_extend(&pass.trackers);
         }
     }
 
@@ -211,7 +214,12 @@ pub extern "C" fn wgpu_render_pass_set_bind_group(
     let mut pass_guard = HUB.render_passes.write();
     let pass = &mut pass_guard[pass_id];
     let bind_group_guard = HUB.bind_groups.read();
-    let bind_group = &bind_group_guard[bind_group_id];
+
+    let bind_group = pass
+        .trackers
+        .bind_groups
+        .use_extend(&*bind_group_guard, bind_group_id, (), ())
+        .unwrap();
 
     assert_eq!(bind_group.dynamic_count, offsets_length);
     let offsets = if offsets_length != 0 {
@@ -232,7 +240,7 @@ pub extern "C" fn wgpu_render_pass_set_bind_group(
         }
     }
 
-    pass.trackers.consume_by_extend(&bind_group.used);
+    pass.trackers.merge_extend(&bind_group.used);
 
     if let Some((pipeline_layout_id, follow_up)) =
         pass.binder
@@ -282,7 +290,7 @@ pub extern "C" fn wgpu_render_pass_set_index_buffer(
     let buffer = pass
         .trackers
         .buffers
-        .get_with_extended_usage(&*buffer_guard, buffer_id, BufferUsage::INDEX)
+        .use_extend(&*buffer_guard, buffer_id, (), BufferUsage::INDEX)
         .unwrap();
 
     let range = offset .. buffer.size;
@@ -316,7 +324,7 @@ pub extern "C" fn wgpu_render_pass_set_vertex_buffers(
     for (vbs, (&id, &offset)) in pass.vertex_state.inputs.iter_mut().zip(buffers.iter().zip(offsets)) {
         let buffer = pass.trackers
             .buffers
-            .get_with_extended_usage(&*buffer_guard, id, BufferUsage::VERTEX)
+            .use_extend(&*buffer_guard, id, (), BufferUsage::VERTEX)
             .unwrap();
         vbs.total_size = buffer.size - offset;
     }
@@ -395,10 +403,11 @@ pub extern "C" fn wgpu_render_pass_set_pipeline(
     let pipeline_guard = HUB.render_pipelines.read();
     let pipeline = &pipeline_guard[pipeline_id];
 
-    assert_eq!(
-        pass.context, pipeline.pass_context,
+    assert!(
+        pass.context.compatible(&pipeline.pass_context),
         "The render pipeline is not compatible with the pass!"
     );
+    assert_eq!(pipeline.sample_count, pass.sample_count, "The render pipeline and renderpass have mismatching sample_count");
 
     pass.blend_color_status
         .require(pipeline.flags.contains(PipelineFlags::BLEND_COLOR));
@@ -450,7 +459,7 @@ pub extern "C" fn wgpu_render_pass_set_pipeline(
             let buffer = pass
                 .trackers
                 .buffers
-                .get_with_extended_usage(&*buffer_guard, buffer_id, BufferUsage::INDEX)
+                .use_extend(&*buffer_guard, buffer_id, (), BufferUsage::INDEX)
                 .unwrap();
 
             let view = hal::buffer::IndexBufferView {
